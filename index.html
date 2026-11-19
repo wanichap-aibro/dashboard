@@ -943,61 +943,141 @@ async function delPrj(){
  if(!pEdit||!confirm('ลบรายการนี้?'))return;
  try{if(pcol)await pcol.doc(pEdit).delete();else{prj=prj.filter(x=>x.id!==pEdit);saveLocal();drawPrj()}}catch(e){alert('ลบไม่สำเร็จ');return}
  closeM()}
+const GOOGLE_SHEET_API_URL = "วาง_URL_ของเว็บแอป_ที่นี่";
 
-// Initialize the dashboard with embedded CSV records before rendering.
-// This also works when the file is opened locally without an online database.
-const previous=loadLocal();
-if(previous.calendarSeedVersion==='2026-new-calendar-v1'&&Array.isArray(previous.tasks))tasks=previous.tasks;else tasks=CSV_CALENDAR_SEED.map(x=>({...x}));
-if(Array.isArray(previous.prj)){
- prj=previous.prj.map(normalizeOwners);
- ptr=(Array.isArray(previous.ptr)?previous.ptr:[]).map(normalizeOwners);
-}else{
- prj=CSV_PROJECT_SEED.map(normalizeOwners);
+function createGoogleSheetsAdapter(apiUrl) {
+  let state = { tasks: [], projects: [], settings: {} };
+  const listeners = { tasks: [], projects: [], settings: {} };
+  let isSyncing = false;
+
+  const notify = () => {
+    listeners.tasks.forEach(fn => fn({ docs: state.tasks.map(d => ({ id: d.id, data: () => d })) }));
+    listeners.projects.forEach(fn => fn({ docs: state.projects.map(d => ({ id: d.id, data: () => d })) }));
+    Object.entries(listeners.settings).forEach(([docId, fns]) => {
+      const docData = state.settings[docId];
+      fns.forEach(fn => fn({ exists: !!docData, data: () => docData || {} }));
+    });
+  };
+
+  const postApi = async (payload) => {
+    const res = await fetch(apiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(payload)
+    });
+    const json = await res.json();
+    if (json.status !== "ok") throw new Error(json.message || "API Error");
+    return json;
+  };
+
+  const syncFromCloud = async (silent = false) => {
+    if (isSyncing) return;
+    isSyncing = true;
+    try {
+      if (!silent) setConn(false, "กำลังซิงค์กับ Y2026_SMP_Blog (Data)…");
+      const res = await fetch(apiUrl + "?t=" + Date.now());
+      const json = await res.json();
+      if (json.status !== "ok") throw new Error("โหลดข้อมูลไม่สำเร็จ");
+
+      if (!json.projects.length && !json.settings["projects-seeded"]) {
+        await postApi({ action: "seed", collection: "projects", items: CSV_PROJECT_SEED });
+        await postApi({ action: "set", collection: "settings", id: "projects-seeded", data: { done: true } });
+        json.projects = CSV_PROJECT_SEED;
+      }
+
+      state = { tasks: json.tasks || [], projects: json.projects || [], settings: json.settings || {} };
+      notify();
+      setConn(true, "ออนไลน์ · ซิงค์ Y2026_SMP_Blog (Data) แล้ว");
+    } catch (err) {
+      console.error(err);
+      setConn(false, "เชื่อมต่อชีตไม่สำเร็จ · ใช้ข้อมูลในเครื่อง");
+    } finally {
+      isSyncing = false;
+    }
+  };
+
+  const makeCollection = (name) => ({
+    onSnapshot: (cb) => listeners[name].push(cb),
+    add: async (data) => {
+      setConn(true, "กำลังบันทึกลงชีต…");
+      const res = await postApi({ action: "set", collection: name, data });
+      await syncFromCloud(true);
+      return { id: res.id };
+    },
+    doc: (id) => ({
+      set: async (data) => {
+        setConn(true, "กำลังอัปเดตชีต…");
+        await postApi({ action: "set", collection: name, id, data });
+        await syncFromCloud(true);
+      },
+      delete: async () => {
+        setConn(true, "กำลังลบรายการ…");
+        await postApi({ action: "delete", collection: name, id });
+        await syncFromCloud(true);
+      }
+    })
+  });
+
+  return {
+    collection: (name) => name === "settings" ? {
+      doc: (docId) => ({
+        onSnapshot: (cb) => (listeners.settings[docId] = listeners.settings[docId] || []).push(cb),
+        set: async (data) => {
+          await postApi({ action: "set", collection: "settings", id: docId, data });
+          state.settings[docId] = data;
+          notify();
+        }
+      })
+    } : makeCollection(name),
+    start: () => {
+      syncFromCloud(false);
+      setInterval(() => syncFromCloud(true), 20000);
+    }
+  };
 }
-if(previous.CFG&&typeof previous.CFG==='object')CFG=previous.CFG;
-if(Array.isArray(previous.pHP))pHP=previous.pHP;
+
+const previous = loadLocal();
+tasks = (previous.calendarSeedVersion === '2026-new-calendar-v1' && Array.isArray(previous.tasks))
+  ? previous.tasks : CSV_CALENDAR_SEED.map(x => ({ ...x }));
+if (Array.isArray(previous.prj)) {
+  prj = previous.prj.map(normalizeOwners);
+  ptr = (Array.isArray(previous.ptr) ? previous.ptr : []).map(normalizeOwners);
+} else {
+  prj = CSV_PROJECT_SEED.map(normalizeOwners);
+}
+if (previous.CFG && typeof previous.CFG === 'object') CFG = previous.CFG;
+if (Array.isArray(previous.pHP)) pHP = previous.pHP;
 applyCfg();
-tasks=tasks.map(adaptCalendarTask);
+tasks = tasks.map(adaptCalendarTask);
 pOpen.add('PDF ประกอบบทความ');
 saveLocal();
 render();
-(async()=>{
- for(let i=0;i<30&&!window.claude;i++)await new Promise(r=>setTimeout(r,100));
- let db=null;try{db=await window.claude?.use('db')}catch(e){}
- if(!db){setConn(false,'โหมดในเครื่อง · บันทึกอัตโนมัติในเบราว์เซอร์');return}
- col=db.collection('tasks');pcol=db.collection('projects');let seededCloud=false;
- try{
-   const marker=db.collection('settings').doc('calendar-csv2026-new-v1');
-   const marked=await marker.get();
-   if(!marked.exists){
-     const old=await col.get();
-     for(const d of old.docs)await col.doc(d.id).delete();
-     for(const t of CSV_CALENDAR_SEED){const {id,...data}=t;await col.doc(id).set(data)}
-     await marker.set({imported:true,count:CSV_CALENDAR_SEED.length,at:Date.now()});
-   }
- }catch(e){console.warn('Calendar migration failed',e);setConn(false,'นำเข้าปฏิทินออนไลน์ไม่สำเร็จ · ใช้ข้อมูลในเครื่อง')}
 
- pcol.onSnapshot(s=>{
-  const a=s.docs.map(d=>({id:d.id,...d.data()}));
-  prj=a.filter(x=>!x.del).map(normalizeOwners);ptr=a.filter(x=>x.del).map(normalizeOwners);
-  // One-time import. Keep a server-side marker so deleted rows never reappear on reload.
-  if(!seededCloud){seededCloud=true;
-   (async()=>{
-    try{
-     const mark=db.collection('settings').doc('csv2026-import-v1');
-     const exists=await mark.get();
-     if(exists.exists)return;
-     const keys=new Set(a.map(x=>[x.project||'',x.sub||'',(x.owners||[]).join(','),x.due||''].join('|').toLowerCase()));
-     const missing=CSV_PROJECT_SEED.filter(x=>!keys.has([x.project,x.sub,x.owners.join(','),x.due].join('|').toLowerCase())&&!a.some(y=>y.id===x.id));
-     for(const x of missing)await pcol.doc(x.id).set(x);
-     await mark.set({imported:true,count:CSV_PROJECT_SEED.length,at:Date.now()});
-    }catch(e){console.warn('CSV import failed',e);setConn(false,'นำเข้าข้อมูลบางส่วนไม่สำเร็จ')}
-   })();
+(function initGoogleSheets() {
+  if (!GOOGLE_SHEET_API_URL || GOOGLE_SHEET_API_URL.includes("วาง_URL")) {
+    setConn(false, "โหมดในเครื่อง · ยังไม่ได้ใส่ลิงก์ Google Sheets");
+    return;
   }
-  saveLocal();if(view==='prj'){render();if(mview==='trash'&&G('ov').classList.contains('s'))trashView()}
- },()=>{setConn(false,'เชื่อมต่อโปรเจกต์ไม่สำเร็จ · ใช้ข้อมูลในเครื่อง')});pmeta=db.collection('settings').doc('prj');pmeta.onSnapshot(s=>{pHP=s.exists?[...(s.data().hp||[])]:[];if(view==='prj')render()},()=>{});cfgDoc=db.collection('settings').doc('main');cfgDoc.onSnapshot(s=>{CFG=s.exists?s.data():{};applyCfg();if(!settingsDirty)settingsDraft=null;render()},()=>{});
- const tm=setTimeout(()=>setConn(false,'เชื่อมต่อช้า…'),10000);
- col.onSnapshot(s=>{clearTimeout(tm);tasks=s.docs.map(d=>adaptCalendarTask({id:d.id,...d.data()}));setConn(true,'ออนไลน์ · อัปเดต realtime');saveLocal();render()},
-  e=>{clearTimeout(tm);setConn(false,'เชื่อมต่อไม่สำเร็จ')});
+  const gs = createGoogleSheetsAdapter(GOOGLE_SHEET_API_URL);
+  col = gs.collection("tasks");
+  pcol = gs.collection("projects");
+  pmeta = gs.collection("settings").doc("prj");
+  cfgDoc = gs.collection("settings").doc("main");
+
+  pcol.onSnapshot(s => {
+    const a = s.docs.map(d => ({ id: d.id, ...d.data() }));
+    prj = a.filter(x => !x.del).map(normalizeOwners);
+    ptr = a.filter(x => x.del).map(normalizeOwners);
+    saveLocal();
+    if (view === 'prj') { render(); if (mview === 'trash' && G('ov').classList.contains('s')) trashView(); }
+  });
+  pmeta.onSnapshot(s => { pHP = s.exists ? [...(s.data().hp || [])] : []; if (view === 'prj') render(); });
+  cfgDoc.onSnapshot(s => { CFG = s.exists ? s.data() : {}; applyCfg(); if (!settingsDirty) settingsDraft = null; render(); });
+  col.onSnapshot(s => {
+    tasks = s.docs.map(d => adaptCalendarTask({ id: d.id, ...d.data() }));
+    saveLocal();
+    render();
+  });
+
+  gs.start();
 })();
-</script></body></html>
