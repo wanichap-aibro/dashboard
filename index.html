@@ -943,7 +943,7 @@ async function delPrj(){
  if(!pEdit||!confirm('ลบรายการนี้?'))return;
  try{if(pcol)await pcol.doc(pEdit).delete();else{prj=prj.filter(x=>x.id!==pEdit);saveLocal();drawPrj()}}catch(e){alert('ลบไม่สำเร็จ');return}
  closeM()}
-const GOOGLE_SHEET_API_URL = "วาง_URL_ของเว็บแอป_ที่นี่";
+const GOOGLE_SHEET_API_URL = "https://script.google.com/a/macros/smile-education.co.th/s/AKfycby9uHPNogu-0ka3b8_HkoyYF7NJvkH1gj-NR9mvsIrdjcTBK6R849hGj96Uwy6zE130uA/exec";
 
 function createGoogleSheetsAdapter(apiUrl) {
   let state = { tasks: [], projects: [], settings: {} };
