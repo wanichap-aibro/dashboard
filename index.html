@@ -949,7 +949,33 @@ function createGoogleSheetsAdapter(apiUrl) {
   let state = { tasks: [], projects: [], settings: {} };
   const listeners = { tasks: [], projects: [], settings: {} };
   let isSyncing = false;
+  let cloudReady = false;
+  let lastSavePending = false;
 
+  // Keep sync diagnostics in the browser console without displaying a top-of-page banner.
+  const warning = (message) => {
+    if (message) console.warn('[SEO Dashboard] ' + message);
+  };
+  const parseJsonMaybe = value => {
+    if (typeof value !== 'string') return value;
+    try { return JSON.parse(value); } catch (_) { return value; }
+  };
+  const unwrap = item => {
+    item = parseJsonMaybe(item);
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+    let data = parseJsonMaybe(item.data);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) data = item;
+    return { ...data, id: String(item.id || data.id || '') };
+  };
+  // Accept Firestore-like {id,data}, arrays, and maps keyed by document id.
+  const normalizeRecords = (raw, label) => {
+    raw = parseJsonMaybe(raw);
+    if (raw == null) return null;
+    const input = Array.isArray(raw) ? raw :
+      (typeof raw === 'object' ? Object.entries(raw).map(([id, data]) => ({ id, data })) : null);
+    if (!input) throw new Error(label + ' มีรูปแบบข้อมูลที่อ่านไม่ได้');
+    return input.map(unwrap).filter(Boolean);
+  };
   const notify = () => {
     listeners.tasks.forEach(fn => fn({ docs: state.tasks.map(d => ({ id: d.id, data: () => d })) }));
     listeners.projects.forEach(fn => fn({ docs: state.projects.map(d => ({ id: d.id, data: () => d })) }));
@@ -958,81 +984,108 @@ function createGoogleSheetsAdapter(apiUrl) {
       fns.forEach(fn => fn({ exists: !!docData, data: () => docData || {} }));
     });
   };
-
-  const postApi = async (payload) => {
-    const res = await fetch(apiUrl, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify(payload)
-    });
+  const getJson = async () => {
+    const res = await fetch(apiUrl + (apiUrl.includes('?') ? '&' : '?') + 't=' + Date.now(), { cache: 'no-store' });
+    if (!res.ok) throw new Error('GET HTTP ' + res.status);
     const json = await res.json();
-    if (json.status !== "ok") throw new Error(json.message || "API Error");
+    if (json.status !== 'ok') throw new Error(json.message || 'API GET ไม่สำเร็จ');
     return json;
   };
-
-  const syncFromCloud = async (silent = false) => {
-    if (isSyncing) return;
+  const postApi = async (payload) => {
+    const res = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error('POST HTTP ' + res.status);
+    const json = await res.json();
+    if (json.status !== 'ok') throw new Error(json.message || 'API POST ไม่สำเร็จ');
+    return json;
+  };
+  const syncFromCloud = async (silent = false, force = false) => {
+    if (isSyncing) return false;
     isSyncing = true;
     try {
-      if (!silent) setConn(false, "กำลังซิงค์กับ Y2026_SMP_Blog (Data)…");
-      const res = await fetch(apiUrl + "?t=" + Date.now());
-      const json = await res.json();
-      if (json.status !== "ok") throw new Error("โหลดข้อมูลไม่สำเร็จ");
-
-      if (!json.projects.length && !json.settings["projects-seeded"]) {
-        await postApi({ action: "seed", collection: "projects", items: CSV_PROJECT_SEED });
-        await postApi({ action: "set", collection: "settings", id: "projects-seeded", data: { done: true } });
-        json.projects = CSV_PROJECT_SEED;
+      if (!silent) setConn(false, 'กำลังตรวจสอบข้อมูล Google Sheets…');
+      const json = await getJson();
+      const rawTasks = json.tasks ?? json.data?.tasks ?? json.collections?.tasks;
+      const rawProjects = json.projects ?? json.data?.projects ?? json.collections?.projects;
+      const rawSettings = json.settings ?? json.data?.settings ?? json.collections?.settings;
+      // Never treat missing tasks as an empty collection. It may be an API schema mismatch.
+      if (rawTasks === undefined) {
+        throw new Error('API ตอบ status=ok แต่ไม่มีฟิลด์ tasks (พบ: ' + Object.keys(json).join(', ') + ')');
       }
-
-      state = { tasks: json.tasks || [], projects: json.projects || [], settings: json.settings || {} };
+      const incomingTasks = normalizeRecords(rawTasks, 'tasks');
+      const incomingProjects = rawProjects === undefined ? null : normalizeRecords(rawProjects, 'projects');
+      const incomingSettings = parseJsonMaybe(rawSettings);
+      const validTasks = incomingTasks.filter(t => t.title && /^\d{4}-\d{2}-\d{2}$/.test(String(t.date || '')));
+      if (incomingTasks.length && validTasks.length !== incomingTasks.length) {
+        throw new Error('พบงาน ' + incomingTasks.length + ' รายการ แต่มีเพียง ' + validTasks.length + ' รายการที่มี title/date ถูกต้อง; กรุณาตรวจรูปแบบข้อมูล API');
+      }
+      // Empty result must not silently erase existing tasks from the visible dashboard or local cache.
+      if (!incomingTasks.length && tasks.length && !force) {
+        cloudReady = false;
+        warning('Google Sheets API ส่งรายการงานกลับมา 0 รายการ แต่ Dashboard มีข้อมูลสำรอง ' + tasks.length + ' รายการ จึงยังไม่แทนข้อมูลเดิมและปิดการแก้ไขชั่วคราว\nกรุณาตรวจว่า Apps Script อ่านแท็บ/คอลเลกชัน tasks ถูกต้อง (เปิด Console เพื่อดูรายละเอียด)');
+        setConn(false, 'API ตอบกลับว่าง · รักษาข้อมูลเดิมไว้');
+        console.warn('[SEO Dashboard] Empty API tasks protected; response keys:', Object.keys(json));
+        return false;
+      }
+      if (!incomingTasks.length && !force) {
+        cloudReady = false;
+        warning('Google Sheets API ส่งงานกลับมา 0 รายการ แม้คุณคาดว่าชีตมีข้อมูล กรุณาตรวจการอ่าน collection tasks ใน Apps Script ก่อนเพิ่มหรือแก้ไขข้อมูล');
+        setConn(false, 'API ส่งงาน 0 รายการ · ต้องตรวจสอบ');
+        return false;
+      }
+      state = {
+        tasks: validTasks,
+        projects: incomingProjects ?? state.projects,
+        settings: incomingSettings && typeof incomingSettings === 'object' && !Array.isArray(incomingSettings) ? incomingSettings : state.settings
+      };
+      cloudReady = true;
+      warning('');
       notify();
-      setConn(true, "ออนไลน์ · ซิงค์ Y2026_SMP_Blog (Data) แล้ว");
+      setConn(true, 'ออนไลน์ · โหลดงาน ' + state.tasks.length + ' รายการ · โปรเจกต์ ' + state.projects.length + ' รายการ');
+      return true;
     } catch (err) {
-      console.error(err);
-      setConn(false, "เชื่อมต่อชีตไม่สำเร็จ · ใช้ข้อมูลในเครื่อง");
-    } finally {
-      isSyncing = false;
-    }
+      cloudReady = false;
+      console.error('[SEO Dashboard] sync failed', err);
+      warning('อ่าน Google Sheets ไม่สำเร็จ: ' + err.message + '\nยังคงข้อมูลเดิมในเครื่องไว้ และปิดการแก้ไขชั่วคราวเพื่อป้องกันข้อมูลสูญหาย');
+      setConn(false, 'เชื่อมต่อชีตผิดพลาด · ไม่เขียนทับข้อมูลเดิม');
+      return false;
+    } finally { isSyncing = false; }
   };
-
-  const makeCollection = (name) => ({
-    onSnapshot: (cb) => listeners[name].push(cb),
-    add: async (data) => {
-      setConn(true, "กำลังบันทึกลงชีต…");
-      const res = await postApi({ action: "set", collection: name, data });
-      await syncFromCloud(true);
-      return { id: res.id };
-    },
-    doc: (id) => ({
-      set: async (data) => {
-        setConn(true, "กำลังอัปเดตชีต…");
-        await postApi({ action: "set", collection: name, id, data });
-        await syncFromCloud(true);
-      },
-      delete: async () => {
-        setConn(true, "กำลังลบรายการ…");
-        await postApi({ action: "delete", collection: name, id });
-        await syncFromCloud(true);
+  const checkedWrite = async payload => {
+    if (!cloudReady) throw new Error('ยังตรวจสอบรายการงานจาก Google Sheets ไม่สำเร็จ ระบบปิดการเขียนข้อมูลเพื่อความปลอดภัย');
+    if (lastSavePending) throw new Error('กำลังบันทึกรายการก่อนหน้า กรุณาลองอีกครั้ง');
+    lastSavePending = true;
+    try {
+      const result = await postApi(payload);
+      // Avoid skipped refresh while a polling request is already in flight.
+      for (let i = 0; i < 3; i++) {
+        if (!isSyncing) { await syncFromCloud(true); break; }
+        await new Promise(resolve => setTimeout(resolve, 250));
       }
+      return result;
+    } finally { lastSavePending = false; }
+  };
+  const makeCollection = name => ({
+    onSnapshot: cb => listeners[name].push(cb),
+    add: async data => checkedWrite({ action: 'set', collection: name, data }).then(r => ({id: r.id})),
+    doc: id => ({
+      set: async data => { await checkedWrite({ action: 'set', collection: name, id, data }); },
+      delete: async () => { await checkedWrite({ action: 'delete', collection: name, id }); }
     })
   });
-
   return {
-    collection: (name) => name === "settings" ? {
-      doc: (docId) => ({
-        onSnapshot: (cb) => (listeners.settings[docId] = listeners.settings[docId] || []).push(cb),
-        set: async (data) => {
-          await postApi({ action: "set", collection: "settings", id: docId, data });
-          state.settings[docId] = data;
-          notify();
+    collection: name => name === 'settings' ? {
+      doc: docId => ({
+        onSnapshot: cb => (listeners.settings[docId] = listeners.settings[docId] || []).push(cb),
+        set: async data => {
+          await checkedWrite({ action: 'set', collection: 'settings', id: docId, data });
         }
       })
     } : makeCollection(name),
-    start: () => {
-      syncFromCloud(false);
-      setInterval(() => syncFromCloud(true), 20000);
-    }
+    start: () => { syncFromCloud(false); setInterval(() => syncFromCloud(true), 20000); }
   };
 }
 
@@ -1085,4 +1138,3 @@ render();
 </script>
 </body>
 </html>
-Displaying seo_dashboard_fixed_html.html.
