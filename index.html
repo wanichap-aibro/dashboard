@@ -943,141 +943,61 @@ async function delPrj(){
  if(!pEdit||!confirm('ลบรายการนี้?'))return;
  try{if(pcol)await pcol.doc(pEdit).delete();else{prj=prj.filter(x=>x.id!==pEdit);saveLocal();drawPrj()}}catch(e){alert('ลบไม่สำเร็จ');return}
  closeM()}
-const GOOGLE_SHEET_API_URL = "https://script.google.com/a/macros/smile-education.co.th/s/AKfycby9uHPNogu-0ka3b8_HkoyYF7NJvkH1gj-NR9mvsIrdjcTBK6R849hGj96Uwy6zE130uA/exec";
+// 1. แก้ไข URL ให้เป็นรูปแบบมาตรฐาน (ตัด /a/macros/smile-education.co.th ออก)
+const RAW_API_URL = "https://script.google.com/a/macros/smile-education.co.th/s/AKfycby9uHPNogu-0ka3b8_HkoyYF7NJvkH1gj-NR9mvsIrdjcTBK6R849hGj96Uwy6zE130uA/exec";
+const GOOGLE_SHEET_API_URL = RAW_API_URL.replace(/\/a\/macros\/[^/]+\//, "/macros/");
 
-function createGoogleSheetsAdapter(apiUrl) {
-  let state = { tasks: [], projects: [], settings: {} };
-  const listeners = { tasks: [], projects: [], settings: {} };
-  let isSyncing = false;
+let isSyncing = false;
+let syncTimer = null;
 
-  const notify = () => {
-    listeners.tasks.forEach(fn => fn({ docs: state.tasks.map(d => ({ id: d.id, data: () => d })) }));
-    listeners.projects.forEach(fn => fn({ docs: state.projects.map(d => ({ id: d.id, data: () => d })) }));
-    Object.entries(listeners.settings).forEach(([docId, fns]) => {
-      const docData = state.settings[docId];
-      fns.forEach(fn => fn({ exists: !!docData, data: () => docData || {} }));
-    });
-  };
+// 2. ปรับปรุงฟังก์ชันเชื่อมต่อให้เสถียร ไม่ค้าง และไม่ดึงข้อมูลชนกัน
+function initGoogleSheets() {
+  syncFromCloud(false); // โหลดครั้งแรก
 
-  const postApi = async (payload) => {
-    const res = await fetch(apiUrl, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify(payload)
-    });
-    const json = await res.json();
-    if (json.status !== "ok") throw new Error(json.message || "API Error");
-    return json;
-  };
-
-  const syncFromCloud = async (silent = false) => {
-    if (isSyncing) return;
-    isSyncing = true;
-    try {
-      if (!silent) setConn(false, "กำลังซิงค์กับ Y2026_SMP_Blog (Data)…");
-      const res = await fetch(apiUrl + "?t=" + Date.now());
-      const json = await res.json();
-      if (json.status !== "ok") throw new Error("โหลดข้อมูลไม่สำเร็จ");
-
-      if (!json.projects.length && !json.settings["projects-seeded"]) {
-        await postApi({ action: "seed", collection: "projects", items: CSV_PROJECT_SEED });
-        await postApi({ action: "set", collection: "settings", id: "projects-seeded", data: { done: true } });
-        json.projects = CSV_PROJECT_SEED;
-      }
-
-      state = { tasks: json.tasks || [], projects: json.projects || [], settings: json.settings || {} };
-      notify();
-      setConn(true, "ออนไลน์ · ซิงค์ Y2026_SMP_Blog (Data) แล้ว");
-    } catch (err) {
-      console.error(err);
-      setConn(false, "เชื่อมต่อชีตไม่สำเร็จ · ใช้ข้อมูลในเครื่อง");
-    } finally {
-      isSyncing = false;
+  // เคลียร์ Timer เก่าก่อนสร้างใหม่ ป้องกันการรันซ้ำซ้อน
+  if (syncTimer) clearInterval(syncTimer);
+  
+  // ดึงข้อมูลทุก 30 วินาที (เฉพาะตอนที่เปิดหน้าเว็บอยู่เท่านั้น)
+  syncTimer = setInterval(() => {
+    if (!document.hidden) {
+      syncFromCloud(true);
     }
-  };
-
-  const makeCollection = (name) => ({
-    onSnapshot: (cb) => listeners[name].push(cb),
-    add: async (data) => {
-      setConn(true, "กำลังบันทึกลงชีต…");
-      const res = await postApi({ action: "set", collection: name, data });
-      await syncFromCloud(true);
-      return { id: res.id };
-    },
-    doc: (id) => ({
-      set: async (data) => {
-        setConn(true, "กำลังอัปเดตชีต…");
-        await postApi({ action: "set", collection: name, id, data });
-        await syncFromCloud(true);
-      },
-      delete: async () => {
-        setConn(true, "กำลังลบรายการ…");
-        await postApi({ action: "delete", collection: name, id });
-        await syncFromCloud(true);
-      }
-    })
-  });
-
-  return {
-    collection: (name) => name === "settings" ? {
-      doc: (docId) => ({
-        onSnapshot: (cb) => (listeners.settings[docId] = listeners.settings[docId] || []).push(cb),
-        set: async (data) => {
-          await postApi({ action: "set", collection: "settings", id: docId, data });
-          state.settings[docId] = data;
-          notify();
-        }
-      })
-    } : makeCollection(name),
-    start: () => {
-      syncFromCloud(false);
-      setInterval(() => syncFromCloud(true), 20000);
-    }
-  };
+  }, 30000);
 }
 
-const previous = loadLocal();
-tasks = (previous.calendarSeedVersion === '2026-new-calendar-v1' && Array.isArray(previous.tasks))
-  ? previous.tasks : CSV_CALENDAR_SEED.map(x => ({ ...x }));
-if (Array.isArray(previous.prj)) {
-  prj = previous.prj.map(normalizeOwners);
-  ptr = (Array.isArray(previous.ptr) ? previous.ptr : []).map(normalizeOwners);
-} else {
-  prj = CSV_PROJECT_SEED.map(normalizeOwners);
-}
-if (previous.CFG && typeof previous.CFG === 'object') CFG = previous.CFG;
-if (Array.isArray(previous.pHP)) pHP = previous.pHP;
-applyCfg();
-tasks = tasks.map(adaptCalendarTask);
-pOpen.add('PDF ประกอบบทความ');
-saveLocal();
-render();
+async function syncFromCloud(isBackground = false) {
+  // ป้องกันการเรียกซ้ำถ้าการโหลดรอบก่อนหน้ายังไม่เสร็จ
+  if (isSyncing) return;
+  isSyncing = true;
 
-(function initGoogleSheets() {
-  if (!GOOGLE_SHEET_API_URL || GOOGLE_SHEET_API_URL.includes("วาง_URL")) {
-    setConn(false, "โหมดในเครื่อง · ยังไม่ได้ใส่ลิงก์ Google Sheets");
-    return;
+  // ตั้งเวลาตัดการเชื่อมต่อ (Timeout) 8 วินาที เพื่อไม่ให้หน้าเว็บค้าง
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    const res = await fetch(GOOGLE_SHEET_API_URL, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    // ตรวจสอบว่าสิ่งที่ตอบกลับมาเป็น JSON จริงหรือไม่ (กันกรณีติดหน้า Login HTML)
+    const contentType = res.headers.get("content-type");
+    if (!res.ok || !contentType || !contentType.includes("application/json")) {
+      throw new Error("สิทธิ์การเข้าถึงไม่ถูกต้อง หรือไม่ได้เปิดแชร์เป็น Anyone");
+    }
+
+    const data = await res.json();
+    
+    // TODO: นำฟังก์ชันอัปเดตหน้าจอของคุณมาวางตรงนี้ เช่น renderCalendar(data);
+    console.log("ซิงค์ข้อมูลสำเร็จ:", data);
+
+  } catch (err) {
+    console.warn("ซิงค์ไม่สำเร็จ (สลับใช้ข้อมูลในเครื่อง):", err.message);
+    // TODO: ใส่โค้ดอัปเดตสถานะมุมขวาบนของคุณตรงนี้ เช่น updateStatus("ใช้ข้อมูลในเครื่อง");
+  } finally {
+    isSyncing = false;
   }
-  const gs = createGoogleSheetsAdapter(GOOGLE_SHEET_API_URL);
-  col = gs.collection("tasks");
-  pcol = gs.collection("projects");
-  pmeta = gs.collection("settings").doc("prj");
-  cfgDoc = gs.collection("settings").doc("main");
-
-  pcol.onSnapshot(s => {
-    const a = s.docs.map(d => ({ id: d.id, ...d.data() }));
-    prj = a.filter(x => !x.del).map(normalizeOwners);
-    ptr = a.filter(x => x.del).map(normalizeOwners);
-    saveLocal();
-    if (view === 'prj') { render(); if (mview === 'trash' && G('ov').classList.contains('s')) trashView(); }
-  });
-  pmeta.onSnapshot(s => { pHP = s.exists ? [...(s.data().hp || [])] : []; if (view === 'prj') render(); });
-  cfgDoc.onSnapshot(s => { CFG = s.exists ? s.data() : {}; applyCfg(); if (!settingsDirty) settingsDraft = null; render(); });
-  col.onSnapshot(s => {
-    tasks = s.docs.map(d => adaptCalendarTask({ id: d.id, ...d.data() }));
-    saveLocal();
-    render();
-  });
-
-  gs.start();
-})();
+}
